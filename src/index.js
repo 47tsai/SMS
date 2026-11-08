@@ -1,27 +1,171 @@
+// Phase 1 (P0) hardening notes:
+// - CORS is restricted to the inbox origin; the API key is compared in
+//   constant time (SHA-256 digests first); ingest is rate-limited via the
+//   SMS_LIMITER binding declared in wrangler.toml.
+// - SMS content is still forwarded to Discord in full (user decision); long
+//   messages are split across several embed fields instead of being dropped.
+// - Retention is 30 days, measured from server-side ingestion time (UTC).
+//   Discord copies are a separate copy and are NOT deleted by cleanup.
+const ALLOWED_ORIGIN = "https://sms.chi.qzz.io";
+const MAX_BODY_BYTES = 32 * 1024; // 32 KiB: message <=3500 chars (~10.5 KiB UTF-8) + overhead
+const RETENTION_DAYS = 30;
+const DISCORD_FIELD_LIMIT = 1024; // Discord embed field value limit
+
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
+};
+
+const securityHeaders = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
 };
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders, ...securityHeaders },
   });
 }
 
-function safeText(value, maxLength = 1000) {
-  if (value === undefined || value === null) return "";
-  return String(value).slice(0, maxLength);
+// Compares two equal-length byte arrays in constant time. Both inputs here
+// are SHA-256 digests (32 bytes), so length never leaks information.
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
-function authorized(request, env) {
+async function authorized(request, env) {
   const expected = env.SMS_FORWARDER_API_KEY;
   const provided = request.headers.get("X-API-Key") ||
     request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
-  return Boolean(expected && provided && provided === expected);
+  if (!expected || !provided) return false;
+  // Hash both sides first so the comparison is always over fixed-length digests.
+  const encoder = new TextEncoder();
+  const [providedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  return timingSafeEqual(new Uint8Array(providedHash), new Uint8Array(expectedHash));
 }
+
+function clientIp(request) {
+  return request.headers.get("CF-Connecting-IP") || "unknown";
+}
+
+// Returns true when the request may proceed. Fails open (and logs) when the
+// binding is missing or errors, so a limiter outage does not take down SMS
+// ingest. The binding itself is declared in wrangler.toml ([[ratelimits]]).
+async function checkRateLimit(env, key) {
+  if (!env.SMS_LIMITER) return true;
+  try {
+    const { success } = await env.SMS_LIMITER.limit({ key });
+    return success;
+  } catch (error) {
+    console.error("Rate limiter error:", error?.message || error);
+    return true;
+  }
+}
+
+class BodyTooLargeError extends Error {}
+
+// Reads the request body as text, enforcing MAX_BODY_BYTES even when the
+// client sends no Content-Length header.
+async function readBodyText(request) {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength !== null && Number(contentLength) > MAX_BODY_BYTES) {
+    throw new BodyTooLargeError("Content-Length exceeds limit");
+  }
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) throw new BodyTooLargeError("Body exceeds limit");
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(body);
+}
+
+const MAX_SENDER_LENGTH = 200;
+const MAX_MESSAGE_LENGTH = 3500;
+const MAX_RECEIVED_AT_LENGTH = 100;
+
+// Validates an ingest payload. Returns { ok: true, value } or
+// { ok: false, error }. Over-long or mistyped fields are rejected (400);
+// nothing here throws on null / array / non-object input.
+function validatePayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "Request body must be a JSON object" };
+  }
+  const sender = payload.sender ?? payload.from ?? "未知寄件者";
+  const message = payload.message ?? payload.text ?? payload.body;
+  const receivedAt = payload.receivedAt ?? payload.time ?? new Date().toISOString();
+  if (typeof sender !== "string") return { ok: false, error: "sender must be a string" };
+  if (sender.length > MAX_SENDER_LENGTH) return { ok: false, error: "sender is too long" };
+  if (typeof message !== "string" || !message.trim()) return { ok: false, error: "Missing message" };
+  if (message.length > MAX_MESSAGE_LENGTH) return { ok: false, error: "message is too long" };
+  if (typeof receivedAt !== "string") return { ok: false, error: "receivedAt must be a string" };
+  if (receivedAt.length > MAX_RECEIVED_AT_LENGTH) return { ok: false, error: "receivedAt is too long" };
+  return { ok: true, value: { sender: sender || "未知寄件者", message, receivedAt: receivedAt || new Date().toISOString() } };
+}
+
+// Idempotency key for one SMS: SHA-256 over sender + message + receivedAt.
+// A retry from the iOS Shortcut therefore stores and notifies only once.
+async function computeIdempotencyKey(sender, message, receivedAt) {
+  const data = new TextEncoder().encode([sender, message, receivedAt].join("\n"));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Splits a message into Discord embed field values of at most 1024
+// characters each, without splitting a Unicode code point (e.g. emoji)
+// across fields. Chunks joined in order reproduce the original message,
+// so the full text still reaches Discord.
+function splitMessageForDiscord(message) {
+  const chars = Array.from(message);
+  const chunks = [];
+  for (let i = 0; i < chars.length; i += DISCORD_FIELD_LIMIT) {
+    chunks.push(chars.slice(i, i + DISCORD_FIELD_LIMIT).join(""));
+  }
+  return chunks.length ? chunks : [""];
+}
+
+function messageFields(message) {
+  const chunks = splitMessageForDiscord(message);
+  if (chunks.length === 1) return [{ name: "💬 簡訊內容", value: chunks[0] || "(空白)", inline: false }];
+  return chunks.map((chunk, i) => ({
+    name: `💬 簡訊內容（${i + 1}/${chunks.length}）`,
+    value: chunk,
+    inline: false,
+  }));
+}
+
+// Escapes one CSV cell value. A leading formula character (=, +, -, @, tab,
+// CR) is neutralised with a leading single quote so spreadsheets do not
+// execute the cell as a formula. (The inbox page inlines the same logic;
+// keep the two in sync.)
+function escapeCsvCell(value) {
+  let text = String(value ?? "");
+  if (/^[=+\-@\t\r]/.test(text.trimStart())) text = "'" + text;
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+export { validatePayload, computeIdempotencyKey, splitMessageForDiscord, messageFields, escapeCsvCell, timingSafeEqual };
 
 
 function extractVerificationCode(message) {
@@ -53,20 +197,47 @@ function extractVerificationCode(message) {
 
 const SMS_CHI_AUTH_CLIENT_ID = "z2gX_1zn_jmwhnoia2JiVY6FeuTyPcun";
 
-async function authorizedChiAuth(request) {
+// Returns "ok" | "unauthorized" | "upstream_error" so callers can tell an
+// invalid/expired token (401) apart from a Chi Auth outage (502).
+// Never logs tokens or message content.
+async function checkChiAuth(request) {
   const authorization = request.headers.get("Authorization") || "";
-  if (!/^Bearer [A-Za-z0-9_-]{40,80}$/.test(authorization)) return false;
+  if (!/^Bearer [A-Za-z0-9_-]{40,80}$/.test(authorization)) return "unauthorized";
+  let response;
   try {
-    const response = await fetch("https://auth.chi.qzz.io/api/userinfo?client_id=" + encodeURIComponent(SMS_CHI_AUTH_CLIENT_ID), {
+    response = await fetch("https://auth.chi.qzz.io/api/userinfo?client_id=" + encodeURIComponent(SMS_CHI_AUTH_CLIENT_ID), {
       headers: { Authorization: authorization, Accept: "application/json" },
       cache: "no-store",
+      signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) return false;
-    const identity = await response.json();
-    return identity.sub === "chi-owner" && identity.aud === SMS_CHI_AUTH_CLIENT_ID;
-  } catch {
-    return false;
+  } catch (error) {
+    console.error("Chi Auth userinfo request failed:", error?.message || error);
+    return "upstream_error";
   }
+  if (!response.ok) {
+    if (response.status >= 500) {
+      console.error("Chi Auth userinfo returned HTTP", response.status);
+      return "upstream_error";
+    }
+    return "unauthorized";
+  }
+  let identity;
+  try {
+    identity = await response.json();
+  } catch (error) {
+    console.error("Chi Auth userinfo returned invalid JSON:", error?.message || error);
+    return "upstream_error";
+  }
+  return identity.sub === "chi-owner" && identity.aud === SMS_CHI_AUTH_CLIENT_ID ? "ok" : "unauthorized";
+}
+
+// Returns a Response when the request must not proceed, or null when the
+// caller is authenticated as chi-owner.
+async function requireChiAuth(request) {
+  const status = await checkChiAuth(request);
+  if (status === "upstream_error") return json({ error: "Authentication service is unavailable" }, 502);
+  if (status !== "ok") return json({ error: "Unauthorized" }, 401);
+  return null;
 }
 
 function page() {
@@ -514,7 +685,13 @@ button:disabled{opacity:.6;cursor:wait}
       showToast("沒有可匯出的簡訊");
       return;
     }
-    const quote = value => '"' + String(value ?? "").replace(/"/g, '""') + '"';
+    // Same formula-injection guard as escapeCsvCell() above: neutralise a
+    // leading =, +, -, @, tab or CR with a leading single quote.
+    const quote = value => {
+      let text = String(value ?? "");
+      if (/^[=+\-@\t\r]/.test(text.trimStart())) text = "'" + text;
+      return '"' + text.replace(/"/g, '""') + '"';
+    };
     const rows = [
       ["寄件者", "簡訊內容", "收到時間", "驗證碼"],
       ...messages.map(message => [message.sender || "未知寄件者", message.message || "", message.received_at || "", extractCode(message.message)])
@@ -545,7 +722,15 @@ button:disabled{opacity:.6;cursor:wait}
 </script>
 </body>
 </html>`, {
-    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      // The page is a single file with inline <style>/<script>, so
+      // 'unsafe-inline' is required for now; the policy still blocks
+      // framing and restricts every other source to the Chi origins.
+      "Content-Security-Policy": "default-src 'self'; style-src 'self' https://chi.qzz.io 'unsafe-inline'; img-src 'self' https://raw.githubusercontent.com data:; font-src 'self' https://chi.qzz.io; script-src 'self' 'unsafe-inline'; connect-src 'self' https://auth.chi.qzz.io; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+      ...securityHeaders,
+    },
   });
 }
 
@@ -554,6 +739,8 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
+      const origin = request.headers.get("Origin");
+      if (origin && origin !== ALLOWED_ORIGIN) return new Response(null, { status: 403, headers: corsHeaders });
       return new Response(null, { status: 204, headers: corsHeaders });
     }
 
@@ -564,21 +751,27 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/messages") {
-      if (!(await authorizedChiAuth(request))) return json({ error: "Unauthorized" }, 401);
+      const authError = await requireChiAuth(request);
+      if (authError) return authError;
       if (!env.SMS_DB) return json({ error: "Database is not configured" }, 503);
       try {
         const result = await env.SMS_DB.prepare(
           "SELECT id, sender, message, received_at FROM messages ORDER BY id DESC LIMIT 500"
         ).all();
         return json({ messages: result.results || [] });
-      } catch {
+      } catch (error) {
+        console.error("Could not read messages:", error?.message || error);
         return json({ error: "Could not read messages" }, 500);
       }
     }
 
     const messageDeleteMatch = url.pathname.match(/^\/api\/messages\/(\d+)$/);
     if (request.method === "DELETE" && messageDeleteMatch) {
-      if (!(await authorizedChiAuth(request))) return json({ error: "Unauthorized" }, 401);
+      const authError = await requireChiAuth(request);
+      if (authError) return authError;
+      if (!(await checkRateLimit(env, `admin:${clientIp(request)}`))) {
+        return json({ error: "Too many requests" }, 429);
+      }
       if (!env.SMS_DB) return json({ error: "Database is not configured" }, 503);
       const id = Number(messageDeleteMatch[1]);
       if (!Number.isSafeInteger(id) || id < 1) return json({ error: "Invalid message ID" }, 400);
@@ -586,18 +779,24 @@ export default {
         const result = await env.SMS_DB.prepare("DELETE FROM messages WHERE id = ?").bind(id).run();
         if (!Number(result.meta?.changes || 0)) return json({ error: "Message not found" }, 404);
         return json({ ok: true, deleted: id });
-      } catch {
+      } catch (error) {
+        console.error("Could not delete message:", error?.message || error);
         return json({ error: "Could not delete message" }, 500);
       }
     }
 
     if (request.method === "POST" && url.pathname === "/api/messages/clear") {
-      if (!(await authorizedChiAuth(request))) return json({ error: "Unauthorized" }, 401);
+      const authError = await requireChiAuth(request);
+      if (authError) return authError;
+      if (!(await checkRateLimit(env, `admin:${clientIp(request)}`))) {
+        return json({ error: "Too many requests" }, 429);
+      }
       if (!env.SMS_DB) return json({ error: "Database is not configured" }, 503);
       try {
         const result = await env.SMS_DB.prepare("DELETE FROM messages").run();
         return json({ ok: true, cleared: Number(result.meta?.changes || 0) });
-      } catch {
+      } catch (error) {
+        console.error("Could not clear messages:", error?.message || error);
         return json({ error: "Could not clear messages" }, 500);
       }
     }
@@ -606,36 +805,84 @@ export default {
       return json({ error: "Not found" }, 404);
     }
 
-    if (!authorized(request, env)) return json({ error: "Unauthorized" }, 401);
+    // Ingest path: rate-limit per client IP first (before auth, so API-key
+    // guessing is also throttled), then authenticate with a timing-safe
+    // comparison, then enforce the body size limit before parsing.
+    if (!(await checkRateLimit(env, `ingest:${clientIp(request)}`))) {
+      return json({ error: "Too many requests" }, 429);
+    }
+    if (!(await authorized(request, env))) return json({ error: "Unauthorized" }, 401);
 
+    let rawBody;
+    try {
+      rawBody = await readBodyText(request);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return json({ error: "Request body too large", limitBytes: MAX_BODY_BYTES }, 413);
+      }
+      console.error("Could not read request body:", error?.message || error);
+      return json({ error: "Could not read request body" }, 400);
+    }
     let payload;
     try {
-      payload = await request.json();
+      payload = JSON.parse(rawBody);
     } catch {
       return json({ error: "Request body must be valid JSON" }, 400);
     }
+    const validation = validatePayload(payload);
+    if (!validation.ok) return json({ error: validation.error }, 400);
+    const { sender, message, receivedAt } = validation.value;
 
-    const sender = safeText(payload.sender ?? payload.from ?? "未知寄件者", 200);
-    const message = safeText(payload.message ?? payload.text ?? payload.body, 3500);
-    const receivedAt = safeText(payload.receivedAt ?? payload.time ?? new Date().toISOString(), 100);
-    if (!message.trim()) return json({ error: "Missing message" }, 400);
-
+    // Idempotency: the same (sender, message, receivedAt) is stored and
+    // notified only once, so an iOS Shortcut retry cannot duplicate it.
+    let savedId = null;
+    let duplicate = false;
     if (env.SMS_DB) {
+      const idempotencyKey = await computeIdempotencyKey(sender, message, receivedAt);
       try {
-        await env.SMS_DB.prepare(
-          "INSERT INTO messages (sender, message, received_at) VALUES (?, ?, ?)"
-        ).bind(sender || "未知寄件者", message, receivedAt || new Date().toISOString()).run();
-      } catch {
-        return json({ error: "Could not save message to database" }, 500);
+        const existing = await env.SMS_DB.prepare(
+          "SELECT id FROM messages WHERE idempotency_key = ?"
+        ).bind(idempotencyKey).first();
+        if (existing) {
+          duplicate = true;
+          savedId = existing.id;
+        } else {
+          const inserted = await env.SMS_DB.prepare(
+            "INSERT INTO messages (sender, message, received_at, idempotency_key, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+30 days'))"
+          ).bind(sender, message, receivedAt, idempotencyKey).run();
+          savedId = inserted.meta?.last_row_id ?? null;
+        }
+      } catch (error) {
+        // A concurrent identical request may have inserted first; treat the
+        // unique-index conflict as a duplicate instead of failing.
+        if (/UNIQUE constraint failed/i.test(error?.message || "")) {
+          try {
+            const existing = await env.SMS_DB.prepare(
+              "SELECT id FROM messages WHERE idempotency_key = ?"
+            ).bind(idempotencyKey).first();
+            if (existing) { duplicate = true; savedId = existing.id; }
+          } catch (lookupError) {
+            console.error("Could not look up duplicate message:", lookupError?.message || lookupError);
+          }
+          if (!duplicate) return json({ error: "Could not save message to database" }, 500);
+        } else {
+          console.error("Could not save message to database:", error?.message || error);
+          return json({ error: "Could not save message to database" }, 500);
+        }
       }
     }
+    if (duplicate) {
+      return json({ ok: true, saved: Boolean(env.SMS_DB), duplicate: true, id: savedId, discord: { ok: true, skipped: "duplicate" } });
+    }
 
-    if (!env.DISCORD_WEBHOOK_URL) return json({ error: "Discord webhook is not configured" }, 500);
+    if (!env.DISCORD_WEBHOOK_URL) {
+      return json({ ok: false, saved: Boolean(env.SMS_DB), id: savedId, discord: { ok: false, error: "Discord webhook is not configured" } }, 500);
+    }
 
     const verificationCode = extractVerificationCode(message);
     const discordFields = [
-      { name: "📱 寄件者", value: sender || "未知寄件者", inline: true },
-      { name: "🕒 收到時間", value: receivedAt || "未知時間", inline: true },
+      { name: "📱 寄件者", value: sender, inline: true },
+      { name: "🕒 收到時間", value: receivedAt, inline: true },
     ];
     if (verificationCode) {
       discordFields.push({
@@ -644,7 +891,9 @@ export default {
         inline: false,
       });
     }
-    discordFields.push({ name: "💬 簡訊內容", value: message || "(空白)", inline: false });
+    // The full message is sent, split across fields if it exceeds Discord's
+    // 1024-character per-field limit (see messageFields()).
+    discordFields.push(...messageFields(message));
 
     const discordPayload = {
       username: "SMS Forwarder",
@@ -664,14 +913,40 @@ export default {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(discordPayload),
+        signal: AbortSignal.timeout(10000),
       });
-    } catch {
-      return json({ error: "Could not reach Discord", saved: Boolean(env.SMS_DB) }, 502);
+    } catch (error) {
+      console.error("Could not reach Discord:", error?.message || error);
+      return json({ ok: false, saved: Boolean(env.SMS_DB), id: savedId, discord: { ok: false, error: "Could not reach Discord" } }, 502);
     }
 
     if (!discordResponse.ok) {
-      return json({ error: "Discord rejected the message", status: discordResponse.status, saved: Boolean(env.SMS_DB) }, 502);
+      console.error("Discord rejected the message: HTTP", discordResponse.status);
+      return json({ ok: false, saved: Boolean(env.SMS_DB), id: savedId, discord: { ok: false, status: discordResponse.status, error: "Discord rejected the message" } }, 502);
     }
-    return json({ ok: true, saved: Boolean(env.SMS_DB) });
+    return json({ ok: true, saved: Boolean(env.SMS_DB), id: savedId, discord: { ok: true, status: discordResponse.status } });
+  },
+
+  // Deletes messages older than RETENTION_DAYS (30). Runs daily via the cron
+  // trigger in wrangler.toml (03:00 Taipei). Expiry is based on server-side
+  // ingestion time (created_at / expires_at, UTC), NOT on receivedAt:
+  // receivedAt is a raw local-time string supplied by the iOS Shortcut with
+  // no timezone, so it cannot be compared reliably. Rows created before the
+  // 0002 migration have expires_at NULL and fall back to created_at.
+  // Discord copies are a separate copy and are NOT deleted by this job.
+  async scheduled(event, env) {
+    if (!env.SMS_DB) {
+      console.error("Scheduled cleanup: database is not configured");
+      return;
+    }
+    try {
+      const result = await env.SMS_DB.prepare(
+        "DELETE FROM messages WHERE (expires_at IS NOT NULL AND expires_at <= datetime('now')) OR (expires_at IS NULL AND created_at <= datetime('now', '-30 days'))"
+      ).run();
+      console.log(`Scheduled cleanup: deleted ${Number(result.meta?.changes || 0)} expired messages`);
+    } catch (error) {
+      console.error("Scheduled cleanup failed:", error?.message || error);
+      throw error;
+    }
   },
 };
