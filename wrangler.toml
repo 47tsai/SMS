@@ -10,3 +10,18 @@ database_id = "3cef1a88-63c0-4224-bc2b-68b814855338"
 [[routes]]
 pattern = "sms.chi.qzz.io"
 custom_domain = true
+
+# Daily cleanup of messages older than 30 days: 19:00 UTC = 03:00 Taipei.
+[triggers]
+crons = ["0 19 * * *"]
+
+# Application-layer rate limiting for ingest and admin routes.
+# namespace_id must be unique within the Cloudflare account; "2001" was
+# chosen to not collide with the h repo's SYNC_LIMITER namespace ("1001").
+# If the binding is missing at runtime the Worker logs and proceeds
+# (see checkRateLimit in src/index.js); if the account plan does not
+# support this binding, `wrangler deploy` fails visibly at deploy time.
+[[ratelimits]]
+name = "SMS_LIMITER"
+namespace_id = "2001"
+simple = { limit = 30, period = 60 }
