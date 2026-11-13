@@ -445,10 +445,12 @@ button:disabled{opacity:.6;cursor:wait}
     return "";
   }
   function formatDate(value) {
-    if (!value) return "時間未知";
-    const date = new Date(value);
+    if (value === null || value === undefined || value === "") return "時間未知";
+    const raw = String(value).trim();
+    const numeric = /^\d{10,13}$/.test(raw) ? Number(raw) : null;
+    const date = new Date(numeric === null ? raw : (numeric < 1e12 ? numeric * 1000 : numeric));
     if (Number.isNaN(date.getTime())) return String(value);
-    return new Intl.DateTimeFormat("zh-TW", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+    return new Intl.DateTimeFormat("zh-TW", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date);
   }
   async function copyText(value, label) {
     try {
@@ -880,9 +882,17 @@ export default {
     }
 
     const verificationCode = extractVerificationCode(message);
+    // Android may send Unix milliseconds as a string; iOS may send an ISO date.
+    const receivedAtText = String(receivedAt).trim();
+    const receivedAtNumber = /^\d{10,13}$/.test(receivedAtText) ? Number(receivedAtText) : null;
+    const receivedDate = new Date(receivedAtNumber === null ? receivedAtText : (receivedAtNumber < 1e12 ? receivedAtNumber * 1000 : receivedAtNumber));
+    const validReceivedDate = Number.isNaN(receivedDate.getTime()) ? null : receivedDate;
+    const discordReceivedAt = validReceivedDate
+      ? new Intl.DateTimeFormat("zh-TW", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(validReceivedDate)
+      : receivedAt;
     const discordFields = [
       { name: "📱 寄件者", value: sender, inline: true },
-      { name: "🕒 收到時間", value: receivedAt, inline: true },
+      { name: "🕒 收到時間", value: discordReceivedAt, inline: true },
     ];
     if (verificationCode) {
       discordFields.push({
@@ -902,8 +912,8 @@ export default {
         title: verificationCode ? "🔐 收到簡訊驗證碼" : "📩 收到新簡訊",
         color: 5793266,
         fields: discordFields,
-        footer: { text: "iPhone SMS Forwarder" },
-        timestamp: new Date().toISOString(),
+        footer: { text: "Android SMS Forwarder" },
+        timestamp: (validReceivedDate || new Date()).toISOString(),
       }],
     };
 
